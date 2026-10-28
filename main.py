@@ -2,7 +2,7 @@ import asyncio
 import socket
 import logging
 from dataclasses import dataclass
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, AsyncIterator
 from typing import Iterable, Optional
 
 MAX_HEADER_LEN = 1024 * 8
@@ -30,6 +30,17 @@ class HTTPError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+STATUS_REASONS = {
+    200: b"OK",
+    201: b"Created",
+    400: b"Bad Request",
+    404: b"Not Found",
+    500: b"Internal Server Error",
+    501: b"Internal Server Error",
+}
+
+
 
 class MyBuffer:
     def __init__(self, initial_cap=4096):
@@ -109,19 +120,25 @@ def field_get(headers: Iterable[bytes], key: str) -> Optional[bytes]:
 
     return None
 
+def reader_from_generator(gen: AsyncIterator[bytes]) -> BodyReader:
+    async def reader():
+        async for chunk in gen: 
+            return chunk
+        return b''
+    return BodyReader(-1, reader)
+
 def reader_from_req(client_socket: socket.socket, buf: MyBuffer, req: HTTPReq) -> BodyReader:
     body_len = -1
     contentLen = field_get(req.headers, 'Content-Length')
     if contentLen:
         try:
-            body_len = int(contentLen.decode())
+            body_len = int(contentLen.decode('ascii'))
         except (ValueError, TypeError):
             raise HTTPError(400, 'bad Content-Length')
 
     body_allowed = not (req.method.upper() in ['GET', 'HEAD'])
     transfer_encoding = field_get(req.headers, 'Transfer-Encoding')
-    chunked = (transfer_encoding is not None) and str(transfer_encoding).upper() == 'CHUNKED'
-
+    chunked = (transfer_encoding is not None) and transfer_encoding.decode('ascii').upper() == 'CHUNKED'
     if not body_allowed and (body_len > 0 or chunked):
         raise HTTPError(400, 'HTTP body not allowed')
 
@@ -131,9 +148,74 @@ def reader_from_req(client_socket: socket.socket, buf: MyBuffer, req: HTTPReq) -
     if body_len >= 0: # with Content-Length
         return reader_from_conn_length(client_socket, buf, body_len)
     elif chunked:
-        raise HTTPError(501, 'TODO')
+        return reader_from_generator(read_chunks(client_socket, buf))
     else: # read the rest of the connection
-        raise HTTPError(501, 'TODO')
+        return reader_from_conn_eof(client_socket, buf)
+
+
+async def buf_expect_more(loop, client_socket: socket.socket, buf: MyBuffer) -> None:
+    if buf.bytes_used == 0:
+        n_bytes = await loop.sock_recv_into(client_socket, buf.get_receive_slice())
+        buf.feed(n_bytes)
+
+        if n_bytes == 0:
+            raise Exception('Unexpected EOF from HTTP body')
+
+async def read_chunks(client_socket: socket.socket, buf: MyBuffer) -> AsyncIterator[bytes]:
+    loop = asyncio.get_running_loop()
+    last = False
+
+    while not last:
+         # read chunk len
+        idx = buf.buffer.find(b'\r\n', 0, buf.bytes_used)
+
+        if idx < 0:
+            n_bytes = await loop.sock_recv_into(client_socket, buf.get_receive_slice())
+            buf.feed(n_bytes)
+            if n_bytes == 0:
+                raise Exception('Unexpected EOF from HTTP body')
+            continue
+        
+        remain = buf.pop_bytes(idx+2)
+        try:
+            remain = int(remain.decode('ascii'), 16)
+        except (ValueError, TypeError):
+            raise HTTPError(400, 'bad chunk length')
+
+        last = remain == 0
+         # read chunk
+        while remain > 0:
+            await buf_expect_more(loop, client_socket, buf)
+    
+            consume = min(buf.bytes_used, remain)
+            remain -= consume
+            yield buf.pop_bytes(consume)
+
+        await buf_expect_more(loop, client_socket, buf)
+        buf.pop_bytes(2) # the chunk data is followed by CRLF
+        
+def reader_from_conn_eof(client_socket: socket.socket, buf: MyBuffer) -> BodyReader:
+    loop = asyncio.get_running_loop()
+    async def reader():
+            if buf.bytes_used > 0:
+                return buf.pop_bytes(buf.bytes_used)
+            try:
+                n_bytes = await asyncio.wait_for(
+                    loop.sock_recv_into(client_socket, buf.get_receive_slice()),
+                    timeout=1.0
+                )
+                buf.feed(n_bytes)
+            except asyncio.TimeoutError:
+                return b''
+
+            if n_bytes > 0:
+                return buf.pop_bytes(buf.bytes_used)
+            else:
+                return b''
+            
+            
+            
+    return BodyReader(-1, reader)
 
 def reader_from_conn_length(client_socket: socket.socket, buf: MyBuffer, remain: int) -> BodyReader:
     loop = asyncio.get_running_loop()
@@ -141,12 +223,7 @@ def reader_from_conn_length(client_socket: socket.socket, buf: MyBuffer, remain:
         nonlocal remain
         if remain == 0:
             return b''
-        if buf.bytes_used == 0:
-            n_bytes = await loop.sock_recv_into(client_socket, buf.get_receive_slice())
-            buf.feed(n_bytes)
-
-            if n_bytes == 0:
-                raise Exception('Unexpected EOF from HTTP body')
+        await buf_expect_more(loop, client_socket, buf)
 
         consume = min(buf.bytes_used, remain)
         remain -= consume
@@ -165,13 +242,10 @@ def reader_from_memory(data: bytes) -> BodyReader:
 
     return BodyReader(length=len(data), read=read_chunk)
 
-STATUS_REASONS = {
-    200: b"OK",
-    201: b"Created",
-    400: b"Bad Request",
-    404: b"Not Found",
-    500: b"Internal Server Error",
-}
+async def count_sheep() -> AsyncIterator[bytes]:
+    for i in range(1, 10):
+        await asyncio.sleep(1)
+        yield f"{str(i)}\n".encode()
 
 def encode_http_resp(resp: HTTPRes) -> bytes:
     reason = STATUS_REASONS.get(resp.code, b"OK")
@@ -180,27 +254,40 @@ def encode_http_resp(resp: HTTPRes) -> bytes:
     return status_line + header_block + b"\r\n"
 
 async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
-    print(req)
-    res_body = reader_from_memory(b"hello world.\n")
-    if req.uri.decode().lower() == '/echo':
-        res_body = body_reader
+    match req.uri.decode().lower():
+        case '/echo':
+            res_body = body_reader
+        case '/sheep':
+            res_body = reader_from_generator(count_sheep())
+        case _:
+            res_body = reader_from_memory(b"hello world.\n")
+    
     return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=res_body)
-
 
 async def write_http_res(client_socket: socket.socket, res: HTTPRes) -> None:
     if res.body.length < 0:
-        raise Exception('TODO: chunked encoding')
+        res.headers.append(bytes(f"Transfer-Encoding: chunked", 'ascii'))
+    else:
+        assert not field_get(res.headers, 'Content-Length')
+        res.headers.append(bytes(f"Content-Length: {res.body.length}", 'ascii'))
     
-    assert not field_get(res.headers, 'Content-Length')
-    res.headers.append(bytes(f"Content-Length: {res.body.length}", 'utf-8'))
     loop = asyncio.get_running_loop()
+    
+    # write the header
     await loop.sock_sendall(client_socket, encode_http_resp(res))
 
-    while True:
+    # write the body
+    last = False
+    while not last:
         data = await res.body.read()
-        if len(data) == 0:
-            break
-        await loop.sock_sendall(client_socket, data)
+        last = len(data) == 0
+        
+        if res.body.length < 0: # chuncked encoding
+            size_hex = f"{len(data):X}".encode('ascii')
+            data = size_hex + b"\r\n" + data + b"\r\n" 
+
+        if len(data) > 0:
+            await loop.sock_sendall(client_socket, data)
 
 async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.socket):
     buffer = MyBuffer()
@@ -221,6 +308,7 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
                 continue
 
             # we have a complete req to handle!!!
+            print(req)                
             req_body: BodyReader = reader_from_req(client_socket, buffer, req)
             res = await handle_req(req, req_body)
             await write_http_res(client_socket, res)
@@ -229,8 +317,10 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
                 return
 
             # make sure that the req body is completely consumed
-            while len(await req_body.read()) > 0:
-                pass
+            last = False
+            while not last:
+                data = await res.body.read()
+                last = len(data) == 0
     except HTTPError as ex:
         logging.exception(ex)
         res = HTTPRes(ex.code, [], reader_from_memory(ex.message.encode()))

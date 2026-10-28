@@ -5,6 +5,17 @@ Content-Length: 21
 
 {"query": "test"}
 
+POST /echo HTTP/1.1
+Host: localhost:1234
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+9
+{"query":
+7
+"test"}
+0
+
 GET /test HTTP/1.1
 Host: localhost:1234
 

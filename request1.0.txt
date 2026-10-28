@@ -1,0 +1,10 @@
+POST /echo HTTP/1.0
+Host: localhost:1234
+Content-Type: application/text
+
+the file in 1.0 is the
+rest of the connection no matter what
+
+
+yet more data xd
+
