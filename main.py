@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import os, stat
 import logging
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, AsyncIterator
@@ -11,6 +12,7 @@ MAX_HEADER_LEN = 1024 * 8
 class BodyReader:
     length: int
     read: Callable[[], Awaitable[bytes]]
+    close: Optional[Callable[[], None]] = None
 
 @dataclass
 class HTTPReq:
@@ -232,20 +234,49 @@ def reader_from_conn_length(client_socket: socket.socket, buf: MyBuffer, remain:
 
 def reader_from_memory(data: bytes) -> BodyReader:
     done = False
-
     async def read_chunk() -> bytes:
         nonlocal done
         if done:
             return b""
         done = True
         return data
-
+ 
     return BodyReader(length=len(data), read=read_chunk)
+
+def reader_from_static_file(fd, size):
+    got = 0
+    async def reader():
+        nonlocal got
+        data = fd.read()
+        got += len(data)
+        if got > size or (got < size and len(data) == 0):
+            print(size, got)
+            # file size changed
+            raise Exception('file size changed, abandon it!')
+
+        return data
+    return BodyReader(size, reader, lambda: fd.close())
 
 async def count_sheep() -> AsyncIterator[bytes]:
     for i in range(1, 10):
         await asyncio.sleep(1)
         yield f"{str(i)}\n".encode()
+
+async def serve_static_file(path: str) -> HTTPRes:
+    try:
+        path = './' + path
+        s = os.stat(path)
+        if not stat.S_ISREG(s.st_mode):
+             return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
+        fd = open(path, 'rb')
+        size = s.st_size
+        
+        # the reader is now resposible for closing fd
+        reader = reader_from_static_file(fd, size)
+        
+        return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=reader)
+    except FileNotFoundError:
+        return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
 
 def encode_http_resp(resp: HTTPRes) -> bytes:
     reason = STATUS_REASONS.get(resp.code, b"OK")
@@ -259,6 +290,8 @@ async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
             res_body = body_reader
         case '/sheep':
             res_body = reader_from_generator(count_sheep())
+        case p if p.startswith('/static'):
+            return await serve_static_file(p)
         case _:
             res_body = reader_from_memory(b"hello world.\n")
     
@@ -309,18 +342,23 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
 
             # we have a complete req to handle!!!
             print(req)                
+            
             req_body: BodyReader = reader_from_req(client_socket, buffer, req)
             res = await handle_req(req, req_body)
-            await write_http_res(client_socket, res)
+            try:
+                await write_http_res(client_socket, res)
 
-            if req.version in ['1.0', 'HTTP/1.0']:
-                return
+                if req.version in ['1.0', 'HTTP/1.0']:
+                    return
 
-            # make sure that the req body is completely consumed
-            last = False
-            while not last:
-                data = await res.body.read()
-                last = len(data) == 0
+                # make sure that the req body is completely consumed
+                last = False
+                while not last:
+                    data = await res.body.read()
+                    last = len(data) == 0
+            finally:
+                if res.body.close is not None:
+                    res.body.close()
     except HTTPError as ex:
         logging.exception(ex)
         res = HTTPRes(ex.code, [], reader_from_memory(ex.message.encode()))
