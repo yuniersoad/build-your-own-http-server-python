@@ -323,7 +323,7 @@ async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
     return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=res_body)
 
 
-async def write_http_res(client_socket: socket.socket, res: HTTPRes) -> None:
+async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPReq) -> None:
     if res.body.length < 0:
         res.headers.append(bytes(f"Transfer-Encoding: chunked", 'ascii'))
     else:
@@ -336,18 +336,19 @@ async def write_http_res(client_socket: socket.socket, res: HTTPRes) -> None:
     # write the header
     await loop.sock_sendall(client_socket, encode_http_resp(res))
 
-    # write the body
-    last = False
-    while not last:
-        data = await res.body.read()
-        last = len(data) == 0
+    if req.method != 'HEAD':
+        # write the body
+        last = False
+        while not last:
+            data = await res.body.read()
+            last = len(data) == 0
 
-        if res.body.length < 0:  # chuncked encoding
-            size_hex = f"{len(data):X}".encode('ascii')
-            data = size_hex + b"\r\n" + data + b"\r\n"
+            if res.body.length < 0:  # chuncked encoding
+                size_hex = f"{len(data):X}".encode('ascii')
+                data = size_hex + b"\r\n" + data + b"\r\n"
 
-        if len(data) > 0:
-            await loop.sock_sendall(client_socket, data)
+            if len(data) > 0:
+                await loop.sock_sendall(client_socket, data)
 
 
 async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.socket):
@@ -374,7 +375,7 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
             req_body: BodyReader = reader_from_req(client_socket, buffer, req)
             res = await handle_req(req, req_body)
             try:
-                await write_http_res(client_socket, res)
+                await write_http_res(client_socket, res, req)
 
                 if req.version in ['1.0', 'HTTP/1.0']:
                     return
@@ -391,7 +392,7 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
         logging.exception(ex)
         res = HTTPRes(ex.code, [], reader_from_memory(ex.message.encode()))
         try:
-            await write_http_res(client_socket, res)
+            await write_http_res(client_socket, res, req)
         except Exception:
             pass  # ignore
     except Exception as ex:

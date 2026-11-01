@@ -16,7 +16,10 @@ Transfer-Encoding: chunked
 "test"}
 0
 
-GET /test HTTP/1.1
+GET /static/style.css HTTP/1.1
+Host: localhost:1234
+
+HEAD /static/style.css HTTP/1.1
 Host: localhost:1234
 
 GET / HTTP/1.1
