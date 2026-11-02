@@ -5,7 +5,7 @@ import stat
 import logging
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, AsyncIterator
-from typing import Iterable, Optional
+from typing import BinaryIO, Iterable, Optional
 
 MAX_HEADER_LEN = 1024 * 8
 
@@ -44,6 +44,7 @@ STATUS_REASONS = {
     201: b"Created",
     400: b"Bad Request",
     404: b"Not Found",
+    416: b"Requested range not satisfiable",
     500: b"Internal Server Error",
     501: b"Internal Server Error",
 }
@@ -262,12 +263,71 @@ def reader_from_memory(data: bytes) -> BodyReader:
     return BodyReader(length=len(data), read=read_chunk)
 
 
-def reader_from_static_file(fd, size):
+def parse_http_range(range_header: str, file_size: int) -> Optional[tuple[int, int]]:
+    """
+    Parses an HTTP Range header (bytes=start-, bytes=start-end, bytes=-suffix)
+    and returns an inclusive (start, end) tuple for reading the file,
+    or None if unsatisfiable (should trigger a 416 status code).
+    """
+    if file_size <= 0:
+        return None
+
+    if not range_header.startswith("bytes="):
+        return None
+
+    spec = range_header[len("bytes="):]
+    if "-" not in spec:
+        return None
+
+    start_str, end_str = spec.split("-", 1)
+
+    try:
+        # Format 3: bytes=-suffix-length (e.g., bytes=-500)
+        if start_str == "" and end_str != "":
+            suffix_length = int(end_str)
+            if suffix_length <= 0:
+                return None
+            start = max(0, file_size - suffix_length)
+            end = file_size - 1
+            return (start, end)
+
+        # Format 1: bytes=start- (e.g., bytes=500-)
+        elif start_str != "" and end_str == "":
+            start = int(start_str)
+            if start >= file_size:
+                return None  # Out of bounds -> 416
+            end = file_size - 1
+            return (start, end)
+
+        # Format 2: bytes=start-end (e.g., bytes=0-499)
+        elif start_str != "" and end_str != "":
+            start = int(start_str)
+            end = int(end_str)
+            if start >= file_size or start > end:
+                return None  # Invalid intersection -> 416
+            
+            # Clamp end if it exceeds the actual file size
+            if end >= file_size:
+                end = file_size - 1
+            return (start, end)
+
+        else:
+            # Invalid format like "bytes=-"
+            return None
+
+    except ValueError:
+        # Non-integer values encountered
+        return None
+
+def reader_from_static_file(fd: BinaryIO, start: int, end: int) -> BodyReader:
     got = 0
+    size = end - start + 1
+    fd.seek(start)
 
     async def reader():
         nonlocal got
-        data = fd.read()
+        remain = size - got
+        data = fd.read(remain)
         got += len(data)
         if got > size or (got < size and len(data) == 0):
             print(size, got)
@@ -284,7 +344,7 @@ async def count_sheep() -> AsyncIterator[bytes]:
         yield f"{str(i)}\n".encode()
 
 
-async def serve_static_file(path: str) -> HTTPRes:
+async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
     try:
         path = './' + path
         s = os.stat(path)
@@ -292,11 +352,21 @@ async def serve_static_file(path: str) -> HTTPRes:
             return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
         fd = open(path, 'rb')
         size = s.st_size
+        start = 0
+        end = size - 1
+
+        range_value = field_get(req.headers, "Range")
+        if range_value is not None:
+            t = parse_http_range(str(range_value, 'ascii'), size)
+            if t is None:
+                return HTTPRes(code=416, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b''))
+            start, end = t
+
 
         # the reader is now resposible for closing fd
-        reader = reader_from_static_file(fd, size)
+        reader = reader_from_static_file(fd, start, end)
 
-        return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=reader)
+        return HTTPRes(code=200, headers=[b"Server: my_first_http_server", b"Accept-Ranges: bytes"], body=reader)
     except FileNotFoundError:
         return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
 
@@ -316,7 +386,7 @@ async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
         case '/sheep':
             res_body = reader_from_generator(count_sheep())
         case p if p.startswith('/static'):
-            return await serve_static_file(p)
+            return await serve_static_file(p, req)
         case _:
             res_body = reader_from_memory(b"hello world.\n")
 
