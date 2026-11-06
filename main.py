@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import socket
 import os
 import stat
@@ -347,15 +348,29 @@ async def count_sheep() -> AsyncIterator[bytes]:
 async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
     try:
         path = './' + path
-        s = os.stat(path)
-        if not stat.S_ISREG(s.st_mode):
+        file_stat = os.stat(path)
+        if not stat.S_ISREG(file_stat.st_mode):
             return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
         fd = open(path, 'rb')
-        size = s.st_size
+        size = file_stat.st_size
         start = 0
         end = size - 1
 
+        ts = int(file_stat.st_mtime)
+        dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+
+        headers = [b"Server: my_first_http_server", b"Accept-Ranges: bytes", f"Last-Modified: {dt.isoformat()}".encode('ascii')]
+
+        # check if client has the same version
+        ifm = field_get(req.headers, 'If-Modified-Since')
+        if (ifm is not None) and (dt == datetime.datetime.fromisoformat(ifm.decode('ascii'))):
+            return HTTPRes(code=304, headers=headers, body=reader_from_memory(b''))
+        
         range_value = field_get(req.headers, "Range")
+        ifr = field_get(req.headers, 'If-Range')
+        if (ifr is not None) and (dt != datetime.datetime.fromisoformat(ifr.decode('ascii'))):
+            range_value = None
+
         if range_value is not None:
             t = parse_http_range(str(range_value, 'ascii'), size)
             if t is None:
@@ -366,7 +381,7 @@ async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
         # the reader is now resposible for closing fd
         reader = reader_from_static_file(fd, start, end)
 
-        return HTTPRes(code=200, headers=[b"Server: my_first_http_server", b"Accept-Ranges: bytes"], body=reader)
+        return HTTPRes(code=200, headers=headers, body=reader)
     except FileNotFoundError:
         return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
 
