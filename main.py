@@ -4,9 +4,12 @@ import socket
 import os
 import stat
 import logging
+import zlib
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, AsyncIterator
 from typing import BinaryIO, Iterable, Optional
+
+from util import is_already_compacted, parse_http_range
 
 MAX_HEADER_LEN = 1024 * 8
 
@@ -14,7 +17,11 @@ MAX_HEADER_LEN = 1024 * 8
 @dataclass
 class BodyReader:
     length: int
-    read: Callable[[], Awaitable[bytes]]
+    # returns:
+    #   b'<some bytes>': if data is available ready to send
+    #   None: if there is no data at the moment, but more is expected... not the most elegant but it is ok for learning purpose
+    #   b'': end of data
+    read: Callable[[], Awaitable[bytes|None]]
     close: Optional[Callable[[], None]] = None
 
 
@@ -30,6 +37,7 @@ class HTTPReq:
 class HTTPRes:
     code: int
     headers: list[bytes]
+    could_compress: bool
     body: BodyReader
 
 
@@ -264,61 +272,7 @@ def reader_from_memory(data: bytes) -> BodyReader:
     return BodyReader(length=len(data), read=read_chunk)
 
 
-def parse_http_range(range_header: str, file_size: int) -> Optional[tuple[int, int]]:
-    """
-    Parses an HTTP Range header (bytes=start-, bytes=start-end, bytes=-suffix)
-    and returns an inclusive (start, end) tuple for reading the file,
-    or None if unsatisfiable (should trigger a 416 status code).
-    """
-    if file_size <= 0:
-        return None
 
-    if not range_header.startswith("bytes="):
-        return None
-
-    spec = range_header[len("bytes="):]
-    if "-" not in spec:
-        return None
-
-    start_str, end_str = spec.split("-", 1)
-
-    try:
-        # Format 3: bytes=-suffix-length (e.g., bytes=-500)
-        if start_str == "" and end_str != "":
-            suffix_length = int(end_str)
-            if suffix_length <= 0:
-                return None
-            start = max(0, file_size - suffix_length)
-            end = file_size - 1
-            return (start, end)
-
-        # Format 1: bytes=start- (e.g., bytes=500-)
-        elif start_str != "" and end_str == "":
-            start = int(start_str)
-            if start >= file_size:
-                return None  # Out of bounds -> 416
-            end = file_size - 1
-            return (start, end)
-
-        # Format 2: bytes=start-end (e.g., bytes=0-499)
-        elif start_str != "" and end_str != "":
-            start = int(start_str)
-            end = int(end_str)
-            if start >= file_size or start > end:
-                return None  # Invalid intersection -> 416
-            
-            # Clamp end if it exceeds the actual file size
-            if end >= file_size:
-                end = file_size - 1
-            return (start, end)
-
-        else:
-            # Invalid format like "bytes=-"
-            return None
-
-    except ValueError:
-        # Non-integer values encountered
-        return None
 
 def reader_from_static_file(fd: BinaryIO, start: int, end: int) -> BodyReader:
     got = 0
@@ -339,22 +293,50 @@ def reader_from_static_file(fd: BinaryIO, start: int, end: int) -> BodyReader:
     return BodyReader(size, reader, lambda: fd.close())
 
 
-async def count_sheep() -> AsyncIterator[bytes]:
-    for i in range(1, 10):
-        await asyncio.sleep(1)
-        yield f"{str(i)}\n".encode()
+def gzip_filter(original_rader: BodyReader) -> BodyReader:
+    compressor = zlib.compressobj(
+        level=6,
+        method=zlib.DEFLATED,
+        wbits=31,
+        memLevel=zlib.DEF_MEM_LEVEL,
+        strategy=zlib.Z_DEFAULT_STRATEGY,
+    )
+    final = False
 
+    async def reader():
+        nonlocal final
+        if final:
+            return b''
+        
+        chunk = await original_rader.read()
+        if len(chunk) == 0:
+            final = True
+            final_chunk = compressor.flush()
+            return final_chunk
+            
+
+        compressed_chunk = compressor.compress(chunk)
+        if compressed_chunk:
+            return compressed_chunk
+
+        # not the most elegant, but was the easy way to adapt this interface for compression
+        # which can some iterations just buffer and not return any data
+        return None
+
+    return BodyReader(-1, reader)
 
 async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
     try:
         path = './' + path
         file_stat = os.stat(path)
         if not stat.S_ISREG(file_stat.st_mode):
-            return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
+            return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'), could_compress=False)
         fd = open(path, 'rb')
         size = file_stat.st_size
         start = 0
         end = size - 1
+
+        is_compressed = is_already_compacted(fd)
 
         ts = int(file_stat.st_mtime)
         dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
@@ -364,7 +346,7 @@ async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
         # check if client has the same version
         ifm = field_get(req.headers, 'If-Modified-Since')
         if (ifm is not None) and (dt == datetime.datetime.fromisoformat(ifm.decode('ascii'))):
-            return HTTPRes(code=304, headers=headers, body=reader_from_memory(b''))
+            return HTTPRes(code=304, headers=headers, body=reader_from_memory(b''), could_compress=False)
         
         range_value = field_get(req.headers, "Range")
         ifr = field_get(req.headers, 'If-Range')
@@ -374,17 +356,21 @@ async def serve_static_file(path: str, req: HTTPReq) -> HTTPRes:
         if range_value is not None:
             t = parse_http_range(str(range_value, 'ascii'), size)
             if t is None:
-                return HTTPRes(code=416, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b''))
+                return HTTPRes(code=416, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b''), could_compress=False)
             start, end = t
 
 
         # the reader is now resposible for closing fd
         reader = reader_from_static_file(fd, start, end)
 
-        return HTTPRes(code=200, headers=headers, body=reader)
+        return HTTPRes(code=200, headers=headers, body=reader, could_compress=not is_compressed)
     except FileNotFoundError:
-        return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'))
+        return HTTPRes(code=404, headers=[b"Server: my_first_http_server"], body=reader_from_memory(b'not found.\n'), could_compress=False)
 
+async def count_sheep() -> AsyncIterator[bytes]:
+    for i in range(1, 10):
+        await asyncio.sleep(1)
+        yield f"{str(i)}\n".encode()
 
 def encode_http_resp(resp: HTTPRes) -> bytes:
     reason = STATUS_REASONS.get(resp.code, b"OK")
@@ -405,16 +391,24 @@ async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
         case _:
             res_body = reader_from_memory(b"hello world.\n")
 
-    return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=res_body)
+    return HTTPRes(code=200, headers=[b"Server: my_first_http_server"], body=res_body, could_compress=True)
 
 
 async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPReq) -> None:
+    # handle compression
+    if res.could_compress:
+        accept_encoding = field_get(req.headers, 'Accept-Encoding')
+        if accept_encoding and b'gzip' in accept_encoding:
+            res.headers.extend([b'Content-Encoding: gzip', b'Vary: content-encoding'])
+            res.body = gzip_filter(res.body)
+            
+
+    # indicate response len encoding
     if res.body.length < 0:
         res.headers.append(bytes(f"Transfer-Encoding: chunked", 'ascii'))
     else:
         assert not field_get(res.headers, 'Content-Length')
-        res.headers.append(
-            bytes(f"Content-Length: {res.body.length}", 'ascii'))
+        res.headers.append(bytes(f"Content-Length: {res.body.length}", 'ascii'))
 
     loop = asyncio.get_running_loop()
 
@@ -426,6 +420,7 @@ async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPRe
         last = False
         while not last:
             data = await res.body.read()
+            if data is None: continue;
             last = len(data) == 0
 
             if res.body.length < 0:  # chuncked encoding
@@ -469,17 +464,20 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
                 last = False
                 while not last:
                     data = await res.body.read()
+                    if data is None: continue;
                     last = len(data) == 0
             finally:
                 if res.body.close is not None:
                     res.body.close()
     except HTTPError as ex:
         logging.exception(ex)
-        res = HTTPRes(ex.code, [], reader_from_memory(ex.message.encode()))
+        res = HTTPRes(ex.code, [b"Server: my_first_http_server"], reader_from_memory(ex.message.encode()), could_compress=False)
         try:
             await write_http_res(client_socket, res, req)
         except Exception:
             pass  # ignore
+    except BrokenPipeError:
+        pass
     except Exception as ex:
         logging.exception(ex)
     finally:
