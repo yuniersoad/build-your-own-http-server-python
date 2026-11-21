@@ -8,11 +8,12 @@ import zlib
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, AsyncIterator
 from typing import BinaryIO, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from util import is_already_compacted, parse_http_range
 
 MAX_HEADER_LEN = 1024 * 8
-
+tpool = None
 
 @dataclass
 class BodyReader:
@@ -272,17 +273,16 @@ def reader_from_memory(data: bytes) -> BodyReader:
     return BodyReader(length=len(data), read=read_chunk)
 
 
-
-
 def reader_from_static_file(fd: BinaryIO, start: int, end: int) -> BodyReader:
     got = 0
     size = end - start + 1
     fd.seek(start)
+    loop = asyncio.get_running_loop()
 
     async def reader():
         nonlocal got
         remain = size - got
-        data = fd.read(remain)
+        data = await loop.run_in_executor(tpool, fd.read, remain)
         got += len(data)
         if got > size or (got < size and len(data) == 0):
             print(size, got)
@@ -303,6 +303,8 @@ def gzip_filter(original_rader: BodyReader) -> BodyReader:
     )
     final = False
 
+    loop = asyncio.get_running_loop()
+
     async def reader():
         nonlocal final
         if final:
@@ -311,11 +313,11 @@ def gzip_filter(original_rader: BodyReader) -> BodyReader:
         chunk = await original_rader.read()
         if len(chunk) == 0:
             final = True
-            final_chunk = compressor.flush()
+            final_chunk = await loop.run_in_executor(tpool, compressor.flush) 
             return final_chunk
             
-
-        compressed_chunk = compressor.compress(chunk)
+        # not much benefit since this is CPU bound, but should improve performance in thread free version of python
+        compressed_chunk = await loop.run_in_executor(tpool, compressor.compress, chunk)
         if compressed_chunk:
             return compressed_chunk
 
@@ -495,6 +497,7 @@ async def main():
     print(f'listening @{address}')
 
     loop = asyncio.get_running_loop()
+    tpool = ThreadPoolExecutor(8)
 
     while True:
         client_socket, client_address = await loop.sock_accept(server_socket)
