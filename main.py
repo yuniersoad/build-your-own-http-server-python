@@ -5,127 +5,16 @@ import os
 import stat
 import logging
 import zlib
-from dataclasses import dataclass
-from collections.abc import Awaitable, Callable, AsyncIterator
-from typing import BinaryIO, Iterable, Optional
+from collections.abc import AsyncIterator
+from typing import Awaitable, BinaryIO, Iterable, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
-
-from util import is_already_compacted, parse_http_range
-
-MAX_HEADER_LEN = 1024 * 8
-tpool = None
-
-@dataclass
-class BodyReader:
-    length: int
-    # returns:
-    #   b'<some bytes>': if data is available ready to send
-    #   None: if there is no data at the moment, but more is expected... not the most elegant but it is ok for learning purpose
-    #   b'': end of data
-    read: Callable[[], Awaitable[bytes|None]]
-    close: Optional[Callable[[], None]] = None
+from http_models import BodyReader, HTTPReq, HTTPRes, HTTPError, STATUS_REASONS
+from wss import WSServer, WSMessage
+from buffer import MyBuffer
+from util import is_already_compacted, parse_http_range, ws_key_accept
 
 
-@dataclass
-class HTTPReq:
-    method: str
-    uri: bytes
-    version: str
-    headers: list[bytes]
-
-
-@dataclass
-class HTTPRes:
-    code: int
-    headers: list[bytes]
-    could_compress: bool
-    body: BodyReader
-
-
-class HTTPError(Exception):
-    def __init__(self, code: int, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
-STATUS_REASONS = {
-    200: b"OK",
-    201: b"Created",
-    400: b"Bad Request",
-    404: b"Not Found",
-    416: b"Requested range not satisfiable",
-    500: b"Internal Server Error",
-    501: b"Internal Server Error",
-}
-
-
-class MyBuffer:
-    def __init__(self, initial_cap=MAX_HEADER_LEN):
-        self.buffer = bytearray(initial_cap)
-        self.bytes_used = 0
-
-    def get_receive_slice(self):
-        return memoryview(self.buffer)[self.bytes_used:]
-
-    def feed(self, n_bytes) -> None:
-        self.bytes_used += n_bytes
-
-    def pop_bytes(self, n: int) -> bytes:
-        if n > self.bytes_used:
-            raise ValueError("Cannot pop more bytes than available in buffer")
-
-        chunk = bytes(self.buffer[:n])
-        self.buffer[:self.bytes_used - n] = self.buffer[n:self.bytes_used]
-        self.bytes_used -= n
-        return chunk
-
-    def cut_message(self) -> HTTPReq | None:
-        """ Gets the HTTPReq in buffer if one is already read
-
-        """
-        idx = self.buffer.find(b'\r\n\r\n', 0, self.bytes_used)
-        if idx < 0:
-            if self.bytes_used >= MAX_HEADER_LEN:
-                raise HTTPError(413, 'header is too large')
-            return None
-
-        end = idx + 4
-        msg = self._parse_http_req(end)
-
-        self.buffer[:self.bytes_used-end] = self.buffer[end:self.bytes_used]
-        self.bytes_used -= end
-        return msg
-
-    def _parse_http_req(self, end_idx: int):
-        req_bytes = self.buffer[:end_idx]
-        lines = req_bytes.splitlines()
-        method, uri, version = lines[0].split()
-
-        headers = []
-        for i in range(1, len(lines)-1):
-            h = bytes(lines[i])
-            if not self._valid_header(h):
-                raise HTTPError(400, 'bad fields in' + h.decode())
-            headers.append(h)
-
-        return HTTPReq(
-                method=method.decode().upper(),
-                uri=uri,
-                version=version.decode().upper(),
-                headers=headers)
-
-    def _valid_header(self, line: bytes) -> bool:
-        if b':' not in line:
-            return False
-
-        name, _, _ = line.partition(b':')
-
-        # Field name must not contain spaces or control characters
-        if not name or any(b <= 32 or b == 127 for b in name):
-            return False
-
-        return True
+tpool: ThreadPoolExecutor | None = None
 
 
 def field_get(headers: Iterable[bytes], key: str) -> Optional[bytes]:
@@ -381,6 +270,38 @@ def encode_http_resp(resp: HTTPRes) -> bytes:
     header_block = b"".join(h + b"\r\n" for h in resp.headers)
     return status_line + header_block + b"\r\n"
 
+async def my_ws_app(ws_server: WSServer) -> None:
+    while True:
+        msg = await ws_server.recv()
+
+        if msg is None:
+            break
+
+        while (data := await msg.read()) != b'':
+            print(data)
+
+def get_ws_app(req: HTTPReq):
+    if req.uri.decode().lower() == '/ws':
+        return my_ws_app
+    
+    return None
+
+async def handle_ws(loop: asyncio.AbstractEventLoop, client_socket: socket.socket, buf: MyBuffer, req: HTTPReq, app: Callable[[WSServer], Awaitable[None]]) -> HTTPRes:
+    ws_server = WSServer(loop, client_socket, buf)
+    loop.create_task(app(ws_server))
+
+    key: bytes = field_get(req.headers, 'Sec-WebSocket-Key')
+    return HTTPRes(
+        code=101, 
+        headers=[
+            b"Server: my_first_http_server", 
+            b"Upgrade: websocket",
+            b"Connection: Upgrade",
+            f"Sec-WebSocket-Accept: {ws_key_accept(key).decode('ascii')}".encode('ascii')
+        ],
+        body=ws_server.get_resp_body_reader,
+        could_compress=False
+    )
 
 async def handle_req(req: HTTPReq, body_reader: BodyReader) -> HTTPRes:
     match req.uri.decode().lower():
@@ -454,8 +375,14 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
             # we have a complete req to handle!!!
             print(req)
 
-            req_body: BodyReader = reader_from_req(client_socket, buffer, req)
-            res = await handle_req(req, req_body)
+            ws_app = get_ws_app(req)
+            
+            if ws_app is not None:
+                res = await handle_ws(loop, client_socket, buffer, req, ws_app)
+            else:
+                req_body: BodyReader = reader_from_req(client_socket, buffer, req)
+                res = await handle_req(req, req_body)
+
             try:
                 await write_http_res(client_socket, res, req)
 
@@ -487,6 +414,8 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
 
 
 async def main():
+    global tpool
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 

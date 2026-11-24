@@ -1,4 +1,6 @@
 from typing import BinaryIO, Optional
+import hashlib
+import base64
 
 NO_COMPRESIR_SIGNATURES = {
     # Compresos clásicos
@@ -85,3 +87,8 @@ def parse_http_range(range_header: str, file_size: int) -> Optional[tuple[int, i
     except ValueError:
         # Non-integer values encountered
         return None
+
+def ws_key_accept(key: bytes) -> bytes:
+    GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    digest = hashlib.sha1(key + GUID).digest()
+    return base64.b64encode(digest)
