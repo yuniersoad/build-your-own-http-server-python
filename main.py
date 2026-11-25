@@ -284,9 +284,19 @@ async def my_ws_app(ws_server: WSServer) -> None:
         resp = WSMessage.from_bytes(f"echo: {arr.decode()}".encode('ascii'))
         await ws_server.send(resp)
 
+async def my_ws_app2(ws_server: WSServer) -> None:
+    while True:
+        await ws_server.send(WSMessage.from_bytes(b'tick!'))
+        await asyncio.sleep(2)
+        await ws_server.send(WSMessage.from_bytes(b'tack!'))
+        await asyncio.sleep(2)
+                
+
 def get_ws_app(req: HTTPReq):
-    if req.uri.decode().lower() == '/ws':
+    if req.uri == b'/ws':
         return my_ws_app
+    if req.uri == b'/ws2':
+        return my_ws_app2
     
     return None
 
@@ -361,7 +371,7 @@ async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPRe
                 await loop.sock_sendall(client_socket, data)
 
 
-async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.socket):
+async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.socket, client_adress):
     buffer = MyBuffer()
     try:
         while True:
@@ -393,7 +403,7 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
             try:
                 await write_http_res(client_socket, res, req)
 
-                if req.version in ['1.0', 'HTTP/1.0']:
+                if req.version in ['1.0', 'HTTP/1.0'] or  ws_app is not None :
                     return
 
                 # make sure that the req body is completely consumed
@@ -417,6 +427,7 @@ async def handle_client(loop: asyncio.AbstractEventLoop, client_socket: socket.s
     except Exception as ex:
         logging.exception(ex)
     finally:
+        print(f"closing client connection: {client_adress}")
         client_socket.close()
 
 
@@ -442,7 +453,7 @@ async def main():
         # avoid buffering at the OS level
         client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        asyncio.create_task(handle_client(loop, client_socket))
+        asyncio.create_task(handle_client(loop, client_socket, client_address))
 
 
 if __name__ == "__main__":

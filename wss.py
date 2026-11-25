@@ -7,8 +7,9 @@ from buffer import MyBuffer
 
 from http_models import BodyReader
 
-WS_DATA_TYPE_TEXT = 0x01
-WS_DATA_TYPE_BINARY = 0x02
+WS_OP_DATA_TYPE_TEXT = 0x01
+WS_OP_DATA_TYPE_BINARY = 0x02
+WS_OP_CLOSE = 0x08
 
 @dataclass
 class WSMessage:
@@ -88,18 +89,26 @@ class WSServer:
                     return
                 
                 continue
+            
+            print(header)
+            self.buf.pop_bytes(header.header_length)
 
+            # closing no need to continue
+            if header.opcode == WS_OP_CLOSE:
+                await self._handle_close(header)
+                return
+
+            # new app message starting
             if not in_fragmented_msg:
                 dataq = asyncio.Queue()
                 msg_len = -1 if not header.fin else header.payload_length
-                msg = WSMessage(WS_DATA_TYPE_TEXT, msg_len, lambda: dataq.get())
+                msg = WSMessage(WS_OP_DATA_TYPE_TEXT, msg_len, lambda: dataq.get())
                 await self.qrecv.put(msg)
 
             in_fragmented_msg = not header.fin
             
-            print(header)
-            self.buf.pop_bytes(header.header_length)
             
+            # send data to app
             remain = header.payload_length
             while remain > 0:
                 if self.buf.bytes_used == 0:
@@ -112,7 +121,7 @@ class WSServer:
                 remain -= consume
                 data = self.buf.pop_bytes(consume)
                 if header.masked:
-                    data =   bytes(byte ^ header.masking_key[i % 4] for i, byte in enumerate(data))
+                    data =  bytes(byte ^ header.masking_key[i % 4] for i, byte in enumerate(data))
                 await dataq.put(data)
                 if not in_fragmented_msg:
                     await dataq.put(b'')
@@ -133,6 +142,35 @@ class WSServer:
             
             while (data := await msg.read()) != b'': 
                 await self.qsock.put(data)
+
+    async def _handle_close(self, header: WSFrameHeader) -> None:
+        while self.buf.bytes_used < header.payload_length:
+            n_bytes = await self.loop.sock_recv_into(self.client_socket, self.buf.get_receive_slice())
+            self.buf.feed(n_bytes)
+            if n_bytes == 0:
+                raise Exception('Unexpected EOF in WS frame')
+        
+        payload = self.buf.pop_bytes(header.payload_length)
+        if header.masked:
+            payload = bytes(byte ^ header.masking_key[i % 4] for i, byte in enumerate(payload))
+
+        if payload and len(payload) >= 2:
+            code = int.from_bytes(payload[:2], "big")
+            reason = payload[2:].decode("utf-8")
+            print(f"Client closing WS: {code}, {reason}")
+    
+        header = WSFrameHeader(
+            opcode=WS_OP_CLOSE,
+            fin=True,
+            header_length=0,
+            payload_length=len(payload),
+            masked=False,
+            masking_key=None,
+        )
+
+        await self.qsock.put(encode_ws_frame_header(header) + payload)
+        await self.qsock.put(b'') # ends the write resp cycle and closes connection
+
 
 def encode_ws_frame_header(header: WSFrameHeader) -> bytes:
     if header.masked:
