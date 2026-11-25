@@ -16,14 +16,31 @@ class WSMessage:
     length: int # -1 if fragmented
     read: Callable[[], Awaitable[bytes]]
 
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "WSMessage":
+        consumed = False
+
+        async def read() -> bytes:
+            nonlocal consumed
+            if consumed:
+                return b''
+            consumed = True
+            return data
+
+        return cls(
+            type=1,  # Text message
+            length=len(data),
+            read=read,
+        )
+
 @dataclass
 class WSFrameHeader:
+    fin: bool
+    opcode: int
     header_length: int
     payload_length: int
-    fin: bool
-    masked: bool
-    opcode: int
-    masking_key: bytes | None
+    masked: bool = False
+    masking_key: bytes | None = None
     
 
 
@@ -42,7 +59,7 @@ class WSServer:
         loop.create_task(self._ws_server_recv())
         loop.create_task(self._ws_server_send())
 
-        self.respBodyReader = BodyReader(length=-1, read=self.qsock.get)
+        self.respBodyReader = BodyReader(length=-1, read=lambda: self.qsock.get())
 
     @property
     def get_resp_body_reader(self) -> BodyReader:
@@ -74,8 +91,8 @@ class WSServer:
 
             if not in_fragmented_msg:
                 dataq = asyncio.Queue()
-                msg = WSMessage(1, -1, lambda: dataq.get())
-                print(msg)
+                msg_len = -1 if not header.fin else header.payload_length
+                msg = WSMessage(WS_DATA_TYPE_TEXT, msg_len, lambda: dataq.get())
                 await self.qrecv.put(msg)
 
             in_fragmented_msg = not header.fin
@@ -102,7 +119,49 @@ class WSServer:
 
 
     async def _ws_server_send(self) -> None:
-        pass
+        while True:
+            msg = await self.qsend.get()
+            header = WSFrameHeader(
+                header_length=0, # not used for sending
+                payload_length=msg.length, # assuming not fragemented for now
+                opcode=msg.type,
+                fin=True,
+            )
+
+            header_bytes = encode_ws_frame_header(header)
+            await self.qsock.put(header_bytes)
+            
+            while (data := await msg.read()) != b'': 
+                await self.qsock.put(data)
+
+def encode_ws_frame_header(header: WSFrameHeader) -> bytes:
+    if header.masked:
+        raise ValueError("Server frames must not be masked")
+
+    if header.opcode not in (0, 1, 2, 8, 9, 10):
+        raise ValueError("Invalid WebSocket opcode")
+
+    length = header.payload_length
+
+    if not 0 <= length < (1 << 63):
+        raise ValueError("Invalid payload length")
+
+    if header.opcode >= 8:
+        if not header.fin:
+            raise ValueError("Control frames cannot be fragmented")
+        if length > 125:
+            raise ValueError("Control frame payload cannot exceed 125 bytes")
+
+    # FIN + opcode. RSV bits are zero.
+    byte1 = (0x80 if header.fin else 0) | header.opcode
+
+    if length < 126:
+        return bytes((byte1, length))
+
+    if length <= 65535:
+        return bytes((byte1, 126)) + length.to_bytes(2, "big")
+
+    return bytes((byte1, 127)) + length.to_bytes(8, "big")
 
 def parse_ws_frame_header(buf: MyBuffer) -> WSFrameHeader | None:
     data = memoryview(buf.buffer)[:buf.bytes_used]

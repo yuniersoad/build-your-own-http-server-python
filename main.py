@@ -277,8 +277,12 @@ async def my_ws_app(ws_server: WSServer) -> None:
         if msg is None:
             break
 
+        arr = bytearray()
         while (data := await msg.read()) != b'':
-            print(data)
+            arr.extend(data)
+
+        resp = WSMessage.from_bytes(f"echo: {arr.decode()}".encode('ascii'))
+        await ws_server.send(resp)
 
 def get_ws_app(req: HTTPReq):
     if req.uri.decode().lower() == '/ws':
@@ -324,11 +328,14 @@ async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPRe
         if accept_encoding and b'gzip' in accept_encoding:
             res.headers.extend([b'Content-Encoding: gzip', b'Vary: content-encoding'])
             res.body = gzip_filter(res.body)
-            
 
+    f = field_get(res.headers, 'Upgrade')
+    is_ws_resp = res.code == 101 and field_get(res.headers, 'Upgrade') == b'websocket'
+    
     # indicate response len encoding
     if res.body.length < 0:
-        res.headers.append(bytes(f"Transfer-Encoding: chunked", 'ascii'))
+        if not is_ws_resp:
+            res.headers.append(bytes(f"Transfer-Encoding: chunked", 'ascii'))
     else:
         assert not field_get(res.headers, 'Content-Length')
         res.headers.append(bytes(f"Content-Length: {res.body.length}", 'ascii'))
@@ -346,7 +353,7 @@ async def write_http_res(client_socket: socket.socket, res: HTTPRes, req: HTTPRe
             if data is None: continue;
             last = len(data) == 0
 
-            if res.body.length < 0:  # chuncked encoding
+            if res.body.length < 0 and not is_ws_resp:  # chuncked encoding
                 size_hex = f"{len(data):X}".encode('ascii')
                 data = size_hex + b"\r\n" + data + b"\r\n"
 
